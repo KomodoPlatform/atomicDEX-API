@@ -448,6 +448,10 @@ impl MmCoin for UtxoStandardCoin {
         Box::new(utxo_common::withdraw(self.clone(), req).boxed().compat())
     }
 
+    fn get_raw_transaction(&self, req: RawTransactionRequest) -> RawTransactionFut {
+        Box::new(utxo_common::get_raw_transaction(self.clone(), req).boxed().compat())
+    }
+
     fn decimals(&self) -> u8 { utxo_common::decimals(&self.utxo_arc) }
 
     fn convert_to_address(&self, from: &str, to_address_format: Json) -> Result<String, String> {

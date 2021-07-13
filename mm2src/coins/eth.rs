@@ -28,7 +28,7 @@ use common::{now_ms, slurp_url, small_rng, DEX_FEE_ADDR_RAW_PUBKEY};
 use derive_more::Display;
 use ethabi::{Contract, Token};
 use ethcore_transaction::{Action, Transaction as UnSignedEthTx, UnverifiedTransaction};
-use ethereum_types::{Address, H160, U256};
+use ethereum_types::{Address, H160, H256, U256};
 use ethkey::{public_to_address, KeyPair, Public};
 use futures::compat::Future01CompatExt;
 use futures::future::{join_all, select, Either, FutureExt, TryFutureExt};
@@ -54,7 +54,8 @@ use web3::{self, Web3};
 
 use super::{BalanceError, BalanceFut, CoinBalance, CoinProtocol, CoinTransportMetrics, CoinsContext, FeeApproxStage,
             FoundSwapTxSpend, HistorySyncState, MarketCoinOps, MmCoin, NegotiateSwapContractAddrErr, NumConversError,
-            NumConversResult, RpcClientType, RpcTransportEventHandler, RpcTransportEventHandlerShared, SwapOps,
+            NumConversResult, RawTransactionError, RawTransactionFut, RawTransactionRequest, RawTransactionRes,
+            RawTransactionResult, RpcClientType, RpcTransportEventHandler, RpcTransportEventHandlerShared, SwapOps,
             TradeFee, TradePreimageError, TradePreimageFut, TradePreimageValue, Transaction, TransactionDetails,
             TransactionEnum, TransactionFut, ValidateAddressResult, WithdrawError, WithdrawFee, WithdrawFut,
             WithdrawRequest, WithdrawResult};
@@ -471,6 +472,23 @@ impl EthCoinImpl {
     pub fn address_from_str(&self, address: &str) -> Result<Address, String> {
         Ok(try_s!(valid_addr_from_str(address)))
     }
+}
+
+async fn get_raw_transaction_impl(coin: EthCoin, req: RawTransactionRequest) -> RawTransactionResult {
+    let hash = H256::from_str(&req.tx_hash[2..req.tx_hash.len()])
+        .map_to_mm(|e| RawTransactionError::InvalidHashError(e.to_string()))?;
+    let web3_tx = coin
+        .web3
+        .eth()
+        .transaction(TransactionId::Hash(hash))
+        .compat()
+        .await
+        .map_err(|e| RawTransactionError::InvalidHashError(e.to_string()))?;
+    let web3_tx = web3_tx.or_mm_err(|| RawTransactionError::Transport(req.tx_hash))?;
+    let raw = signed_tx_from_web3_tx(web3_tx).unwrap();
+    return Ok(RawTransactionRes {
+        tx_hex: BytesJson(rlp::encode(&raw)),
+    });
 }
 
 async fn withdraw_impl(ctx: MmArc, coin: EthCoin, req: WithdrawRequest) -> WithdrawResult {
@@ -2717,6 +2735,10 @@ impl EthTxFeeDetails {
 
 impl MmCoin for EthCoin {
     fn is_asset_chain(&self) -> bool { false }
+
+    fn get_raw_transaction(&self, req: RawTransactionRequest) -> RawTransactionFut {
+        Box::new(get_raw_transaction_impl(self.clone(), req).boxed().compat())
+    }
 
     fn withdraw(&self, req: WithdrawRequest) -> WithdrawFut {
         let ctx = try_f!(MmArc::from_weak(&self.ctx).or_mm_err(|| WithdrawError::InternalError("!ctx".to_owned())));

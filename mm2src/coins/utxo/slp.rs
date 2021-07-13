@@ -6,8 +6,9 @@ use crate::utxo::utxo_common::{self, big_decimal_from_sat_unsigned, generate_tra
 use crate::utxo::{generate_and_send_tx, sat_from_big_decimal, FeePolicy, GenerateTxError, RecentlySpentOutPoints,
                   UtxoCommonOps, UtxoTx};
 use crate::{BalanceError, BalanceFut, CoinBalance, FeeApproxStage, FoundSwapTxSpend, HistorySyncState, MarketCoinOps,
-            MmCoin, NegotiateSwapContractAddrErr, NumConversError, SwapOps, TradeFee, TradePreimageFut,
-            TradePreimageValue, TransactionEnum, TransactionFut, ValidateAddressResult, WithdrawFut, WithdrawRequest};
+            MmCoin, NegotiateSwapContractAddrErr, NumConversError, RawTransactionFut, RawTransactionRequest, SwapOps,
+            TradeFee, TradePreimageFut, TradePreimageValue, TransactionEnum, TransactionFut, ValidateAddressResult,
+            WithdrawFut, WithdrawRequest};
 
 use bitcoin_cash_slp::{slp_send_output, SlpTokenType, TokenId};
 use bitcrypto::dhash160;
@@ -1179,7 +1180,9 @@ impl MmCoin for SlpToken {
 
     fn withdraw(&self, _req: WithdrawRequest) -> WithdrawFut { unimplemented!() }
 
-    fn decimals(&self) -> u8 { self.decimals() }
+    fn get_raw_transaction(&self, _req: RawTransactionRequest) -> RawTransactionFut { unimplemented!() }
+
+    fn decimals(&self) -> u8 { unimplemented!() }
 
     fn convert_to_address(&self, _from: &str, _to_address_format: Json) -> Result<String, String> { unimplemented!() }
 

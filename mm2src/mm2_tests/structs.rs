@@ -505,6 +505,21 @@ pub struct MaxTakerVolResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RawTransactionResult {
+    /// Raw bytes of signed transaction in hexadecimal string, this should be sent as is to send_raw_transaction RPC to broadcast the transaction
+    pub tx_hex: String,
+}
+
+pub mod raw_transaction_error {
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(deny_unknown_fields)]
+    pub struct InvalidCoin {
+        pub coin: String,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransactionDetails {
     pub tx_hex: String,
     pub tx_hash: String,
