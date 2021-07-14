@@ -44,6 +44,8 @@ jobs:
         env:
           WASM_BINDGEN_TEST_TIMEOUT: 120
           GECKODRIVER: '/home/azureagent/wasm/geckodriver'
+          BOB_PASSPHRASE: $(${{ parameters.bob_passphrase }})
+          ALICE_PASSPHRASE: $(${{ parameters.alice_passphrase }})
       # Explicit --test-threads=16 makes testing process slightly faster on agents that have <16 CPU cores.
       # Always run tests on mm2.1 branch and PRs
       - bash: |

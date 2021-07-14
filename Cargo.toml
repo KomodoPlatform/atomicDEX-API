@@ -53,6 +53,7 @@ bitcrypto = { path = "mm2src/mm2_bitcoin/crypto" }
 blake2 = "0.9.1"
 bytes = "0.4"
 chain = { path = "mm2src/mm2_bitcoin/chain" }
+cfg-if = "1.0"
 coins = { path = "mm2src/coins" }
 common = { path = "mm2src/common" }
 crc = "1.8"

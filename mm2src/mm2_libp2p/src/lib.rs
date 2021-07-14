@@ -1,24 +1,47 @@
 #![feature(ip)]
 
+#[macro_use] extern crate lazy_static;
+
 mod adex_ping;
 pub mod atomicdex_behaviour;
+mod network;
 mod peers_exchange;
+pub mod relay_address;
 pub mod request_response;
 mod runtime;
 
 use lazy_static::lazy_static;
 use secp256k1::{Message as SecpMessage, PublicKey as Secp256k1Pubkey, Secp256k1, SecretKey, SignOnly, Signature,
                 VerifyOnly};
-use serde::{de, ser::Serializer, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-pub use atomicdex_behaviour::{spawn_gossipsub, NodeType};
+pub use atomicdex_behaviour::{spawn_gossipsub, AdexBehaviourError, NodeType};
 pub use atomicdex_gossipsub::{GossipsubEvent, GossipsubMessage, MessageId};
-pub use libp2p::PeerId;
+pub use libp2p::{Multiaddr, PeerId};
+pub use relay_address::{RelayAddress, RelayAddressError};
+use serde::{de, Deserialize, Serialize, Serializer};
 
 lazy_static! {
     static ref SECP_VERIFY: Secp256k1<VerifyOnly> = Secp256k1::verification_only();
     static ref SECP_SIGN: Secp256k1<SignOnly> = Secp256k1::signing_only();
+}
+
+#[derive(Clone, Copy)]
+pub enum NetworkInfo {
+    /// The in-memory network.
+    InMemory,
+    /// The distributed network (out of the app memory).
+    Distributed { network_ports: NetworkPorts },
+}
+
+impl NetworkInfo {
+    pub fn in_memory(&self) -> bool { matches!(self, NetworkInfo::InMemory) }
+}
+
+#[derive(Clone, Copy)]
+pub struct NetworkPorts {
+    pub tcp: u16,
+    pub ws: u16,
 }
 
 pub fn encode_message<T: Serialize>(message: &T) -> Result<Vec<u8>, rmp_serde::encode::Error> {

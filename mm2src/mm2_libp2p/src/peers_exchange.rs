@@ -1,4 +1,5 @@
 use crate::request_response::Codec;
+use crate::NetworkInfo;
 use futures::StreamExt;
 use libp2p::swarm::NetworkBehaviour;
 use libp2p::{multiaddr::{Multiaddr, Protocol},
@@ -81,12 +82,12 @@ pub struct PeersExchange {
     #[behaviour(ignore)]
     maintain_peers_interval: Interval,
     #[behaviour(ignore)]
-    netid_port: u16,
+    network_info: NetworkInfo,
 }
 
 #[allow(clippy::new_without_default)]
 impl PeersExchange {
-    pub fn new(netid_port: u16) -> Self {
+    pub fn new(network_info: NetworkInfo) -> Self {
         let codec = Codec::default();
         let protocol = iter::once((PeersExchangeProtocol::Version1, ProtocolSupport::Full));
         let config = RequestResponseConfig::default();
@@ -99,7 +100,7 @@ impl PeersExchange {
                 Instant::now() + Duration::from_secs(REQUEST_PEERS_INITIAL_DELAY),
                 Duration::from_secs(REQUEST_PEERS_INTERVAL),
             ),
-            netid_port,
+            network_info,
         }
     }
 
@@ -132,6 +133,7 @@ impl PeersExchange {
 
         for address in addresses.iter() {
             if !self.validate_global_multiaddr(address) {
+                warn!("Attempt adding a not valid address of the peer '{}': {}", peer, address);
                 return;
             }
         }
@@ -192,6 +194,11 @@ impl PeersExchange {
     }
 
     fn validate_global_multiaddr(&self, address: &Multiaddr) -> bool {
+        let network_ports = match self.network_info {
+            NetworkInfo::Distributed { network_ports } => network_ports,
+            NetworkInfo::InMemory => panic!("PeersExchange must not be used with in-memory network"),
+        };
+
         let mut components = address.iter();
         match components.next() {
             Some(Protocol::Ip4(addr)) => {
@@ -204,7 +211,8 @@ impl PeersExchange {
 
         match components.next() {
             Some(Protocol::Tcp(port)) => {
-                if port != self.netid_port {
+                // currently, `NetworkPorts::ws` is not supported by `PeersExchange`
+                if port != network_ports.tcp {
                     return false;
                 }
             },
@@ -233,6 +241,7 @@ impl PeersExchange {
 
             for address in addresses {
                 if !self.validate_global_multiaddr(address) {
+                    warn!("Received a not valid address: {}", address);
                     return false;
                 }
             }
@@ -312,8 +321,8 @@ impl NetworkBehaviourEventProcess<RequestResponseEvent<PeersExchangeRequest, Pee
 
 #[cfg(test)]
 mod tests {
-    use crate::peers_exchange::{PeerIdSerde, PeersExchange};
-    use crate::PeerId;
+    use super::{NetworkInfo, PeerIdSerde, PeersExchange};
+    use crate::{NetworkPorts, PeerId};
     use libp2p::core::Multiaddr;
     use std::collections::{HashMap, HashSet};
     use std::iter::FromIterator;
@@ -328,7 +337,10 @@ mod tests {
 
     #[test]
     fn test_validate_get_known_peers_response() {
-        let behaviour = PeersExchange::new(3000);
+        let network_info = NetworkInfo::Distributed {
+            network_ports: NetworkPorts { tcp: 3000, ws: 3010 },
+        };
+        let behaviour = PeersExchange::new(network_info);
         let response = HashMap::default();
         assert!(!behaviour.validate_get_known_peers_response(&response));
 

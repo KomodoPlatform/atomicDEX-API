@@ -27,3 +27,12 @@ and we use [rustfmt](https://github.com/rust-lang/rustfmt) to make our code clea
     ```
     cargo clippy -- -D warnings
     ```
+
+### Run WASM tests
+
+1. Install Firefox.
+1. Download Gecko driver for your OS: https://github.com/mozilla/geckodriver/releases
+1. Run the tests
+    ```
+    WASM_BINDGEN_TEST_TIMEOUT=120 GECKODRIVER=PATH_TO_GECKO_DRIVER_BIN wasm-pack test --firefox --headless
+    ```

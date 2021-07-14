@@ -1,5 +1,19 @@
+use crate::mm_error::prelude::*;
 use crate::{now_float, now_ms};
-use std::path::Path;
+use derive_more::Display;
+use std::path::{Path, PathBuf};
+
+pub type FileLockResult<T> = std::result::Result<T, MmError<FileLockError>>;
+
+#[derive(Debug, Display)]
+pub enum FileLockError {
+    #[display(fmt = "Error reading timestamp from {:?}: {}", path, error)]
+    ErrorReadingTimestamp { path: PathBuf, error: String },
+    #[display(fmt = "Error writing timestamp to {:?}: {}", path, error)]
+    ErrorWritingTimestamp { path: PathBuf, error: String },
+    #[display(fmt = "Error creating {:?}: {}", path, error)]
+    ErrorCreatingLockFile { path: PathBuf, error: String },
+}
 
 pub struct FileLock<T: AsRef<Path>> {
     /// Filesystem path of the lock file.
@@ -10,20 +24,26 @@ pub struct FileLock<T: AsRef<Path>> {
 }
 
 /// Records timestamp to a file contents.
-fn touch(path: &dyn AsRef<Path>, timestamp: u64) -> Result<(), String> {
-    std::fs::write(path.as_ref(), timestamp.to_string()).map_err(|e| ERRL!("{:?}", e))
+fn touch(path: &dyn AsRef<Path>, timestamp: u64) -> FileLockResult<()> {
+    std::fs::write(path.as_ref(), timestamp.to_string()).map_to_mm(|error| FileLockError::ErrorWritingTimestamp {
+        path: path.as_ref().to_path_buf(),
+        error: error.to_string(),
+    })
 }
 
 /// Attempts to read timestamp recorded to a file
-fn read_timestamp(path: &dyn AsRef<Path>) -> Result<Option<u64>, String> {
+fn read_timestamp(path: &dyn AsRef<Path>) -> FileLockResult<Option<u64>> {
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(content.parse().ok()),
-        Err(e) => ERR!("{:?}", e),
+        Err(e) => MmError::err(FileLockError::ErrorReadingTimestamp {
+            path: path.as_ref().to_path_buf(),
+            error: e.to_string(),
+        }),
     }
 }
 
 impl<T: AsRef<Path>> FileLock<T> {
-    pub fn lock(lock_path: T, ttl_sec: f64) -> Result<Option<FileLock<T>>, String> {
+    pub fn lock(lock_path: T, ttl_sec: f64) -> FileLockResult<Option<FileLock<T>>> {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -31,34 +51,36 @@ impl<T: AsRef<Path>> FileLock<T> {
         {
             Ok(_) => {
                 let file_lock = FileLock { lock_path, ttl_sec };
-                try_s!(file_lock.touch());
+                file_lock.touch()?;
                 Ok(Some(file_lock))
             },
             Err(ref ie) if ie.kind() == std::io::ErrorKind::AlreadyExists => {
                 // See if the existing lock is old enough to be discarded.
-                match read_timestamp(&lock_path) {
-                    Ok(Some(lm)) => {
+                match read_timestamp(&lock_path)? {
+                    Some(lm) => {
                         if now_float() - lm as f64 > ttl_sec {
                             let file_lock = FileLock { lock_path, ttl_sec };
-                            try_s!(file_lock.touch());
+                            file_lock.touch()?;
                             Ok(Some(file_lock))
                         } else {
                             Ok(None)
                         }
                     },
-                    Ok(None) => {
+                    None => {
                         let file_lock = FileLock { lock_path, ttl_sec };
-                        try_s!(file_lock.touch());
+                        file_lock.touch()?;
                         Ok(Some(file_lock))
                     },
-                    Err(ie) => ERR!("Error checking {:?}: {}", lock_path.as_ref(), ie),
                 }
             },
-            Err(ie) => ERR!("Error creating {:?}: {}", lock_path.as_ref(), ie),
+            Err(ie) => MmError::err(FileLockError::ErrorCreatingLockFile {
+                path: lock_path.as_ref().to_path_buf(),
+                error: ie.to_string(),
+            }),
         }
     }
 
-    pub fn touch(&self) -> Result<(), String> { touch(&self.lock_path, now_ms() / 1000) }
+    pub fn touch(&self) -> FileLockResult<()> { touch(&self.lock_path, now_ms() / 1000) }
 }
 
 impl<T: AsRef<Path>> Drop for FileLock<T> {

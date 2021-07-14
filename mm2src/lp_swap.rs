@@ -92,6 +92,11 @@ use uuid::Uuid;
 #[path = "lp_swap/check_balance.rs"] mod check_balance;
 #[path = "lp_swap/trade_preimage.rs"] mod trade_preimage;
 
+#[cfg(target_arch = "wasm32")]
+#[path = "lp_swap/swap_db.rs"]
+mod swap_db;
+#[path = "lp_swap/swap_lock.rs"] mod swap_lock;
+
 pub use check_balance::{check_other_coin_balance_for_swap, CheckBalanceError};
 pub use maker_swap::{calc_max_maker_vol, check_balance_for_maker_swap, maker_swap_trade_preimage, run_maker_swap,
                      stats_maker_swap_dir, MakerSavedSwap, MakerSwap, MakerTradePreimage, RunMakerSwapInput};
@@ -105,6 +110,14 @@ use taker_swap::{stats_taker_swap_file_path, TakerSwapEvent};
 pub use trade_preimage::trade_preimage_rpc;
 
 pub const SWAP_PREFIX: TopicPrefix = "swap";
+
+cfg_wasm32! {
+    use common::indexed_db::{get_or_initialize_db, ConstructibleDb, DbLocked, DbNamespaceId};
+    use futures::lock::Mutex as AsyncMutex;
+    use swap_db::{InitDbResult, SwapDb};
+
+    pub type SwapDbLocked<'a> = DbLocked<'a, SwapDb>;
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum SwapMsg {
@@ -294,6 +307,11 @@ struct SwapsContext {
     /// Very unpleasant consequences
     shutdown_rx: async_std_sync::Receiver<()>,
     swap_msgs: Mutex<HashMap<Uuid, SwapMsgStore>>,
+    #[cfg(target_arch = "wasm32")]
+    db_namespace: DbNamespaceId,
+    /// The database has to be initialized only once!
+    #[cfg(target_arch = "wasm32")]
+    swap_db: ConstructibleDb<SwapDb>,
 }
 
 impl SwapsContext {
@@ -317,8 +335,12 @@ impl SwapsContext {
             Ok(SwapsContext {
                 running_swaps: Mutex::new(vec![]),
                 banned_pubkeys: Mutex::new(HashMap::new()),
-                swap_msgs: Mutex::new(HashMap::new()),
                 shutdown_rx,
+                swap_msgs: Mutex::new(HashMap::new()),
+                #[cfg(target_arch = "wasm32")]
+                db_namespace: ctx.db_namespace,
+                #[cfg(target_arch = "wasm32")]
+                swap_db: AsyncMutex::new(None),
             })
         })))
     }
@@ -326,6 +348,11 @@ impl SwapsContext {
     pub fn init_msg_store(&self, uuid: Uuid, accept_only_from: bits256) {
         let store = SwapMsgStore::new(accept_only_from);
         self.swap_msgs.lock().unwrap().insert(uuid, store);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub async fn swap_db(&self) -> InitDbResult<SwapDbLocked<'_>> {
+        Ok(get_or_initialize_db(&self.swap_db, self.db_namespace).await?)
     }
 }
 

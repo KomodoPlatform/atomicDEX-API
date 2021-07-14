@@ -1,8 +1,6 @@
 use super::*;
-use crate::tx_history_db::TxHistoryResult;
 use crate::utxo::{RequestTxHistoryResult, UtxoFeeDetails};
-use crate::CoinsContext;
-use crate::TxFeeDetails;
+use crate::{CoinsContext, TxFeeDetails, TxHistoryResult};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use common::jsonrpc_client::JsonRpcErrorType;
 use common::mm_metrics::MetricsArc;

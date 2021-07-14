@@ -682,7 +682,7 @@ fn test_nonce_lock() {
     // Waiting for NONCE_LOCK… might not appear at all if waiting takes less than 0.5 seconds
     // but all transactions are sent successfully still
     // wait_for_log(&ctx.log, 1.1, &|line| line.contains("Waiting for NONCE_LOCK…")));
-    wait_for_log(&ctx.log, 1.1, &|line| line.contains("get_addr_nonce…")).unwrap();
+    block_on(wait_for_log(&ctx, 1.1, |line| line.contains("get_addr_nonce…"))).unwrap();
 }
 
 #[test]

@@ -14,9 +14,9 @@
 
 use super::*;
 use crate::mm2::LpMainParams;
-use common::executor;
 use common::log::{register_callback, LogLevel, WasmCallback};
 use common::wasm_rpc::WasmRpcResponse;
+use common::{executor, set_panic_hook};
 use gstuff::any_to_str;
 use js_sys::Array;
 use num_traits::FromPrimitive;
@@ -104,6 +104,8 @@ pub fn mm2_main(params: JsValue, log_cb: js_sys::Function) -> Result<(), JsValue
     CTX.store(0, Ordering::Relaxed); // Remove the old context ID during restarts.
 
     register_callback(WasmCallback::with_js_function(log_cb));
+    set_panic_hook();
+
     let fut = async move {
         if let Err(true) = LP_MAIN_RUNNING.compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed) {
             console_err!("lp_main already started!");

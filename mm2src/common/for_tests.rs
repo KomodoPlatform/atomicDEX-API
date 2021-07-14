@@ -6,15 +6,15 @@ use http::{HeaderMap, StatusCode};
 use rand::Rng;
 use serde_json::{self as json, Value as Json};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
+use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Mutex;
 
 use crate::executor::Timer;
 use crate::mm_ctx::MmArc;
 use crate::mm_metrics::{MetricType, MetricsJson};
-use crate::{now_float, slurp};
+use crate::now_float;
 
 cfg_wasm32! {
     use crate::log::LogLevel;
@@ -23,7 +23,8 @@ cfg_wasm32! {
 
 cfg_native! {
     use crate::block_on;
-    use crate::log::{dashboard_path, LogState};
+    use crate::log::dashboard_path;
+    use crate::slurp;
     use crate::wio::{slurp_req, POOL};
     use bytes::Bytes;
     use futures::channel::oneshot;
@@ -34,9 +35,9 @@ cfg_native! {
     use std::env;
     use std::fs;
     use std::io::Write;
+    use std::net::Ipv4Addr;
+    use std::path::Path;
     use std::process::Command;
-    use std::thread;
-    use std::time::Duration;
 }
 
 pub const MAKER_SUCCESS_EVENTS: [&str; 11] = [
@@ -196,8 +197,6 @@ pub struct MarketMakerIt {
 #[cfg(target_arch = "wasm32")]
 pub struct MarketMakerIt {
     pub ctx: super::mm_ctx::MmArc,
-    /// Unique (to run multiple instances) IP, like "127.0.0.$x".
-    pub ip: IpAddr,
     /// RPC API key.
     pub userpass: String,
 }
@@ -214,16 +213,17 @@ impl std::fmt::Debug for MarketMakerIt {
 }
 
 impl MarketMakerIt {
-    /// Create a new temporary directory and start a new MarketMaker process there.
-    ///
-    /// * `conf` - The command-line configuration passed to the MarketMaker.
-    ///            Unique local IP address is injected as "myipaddr" unless this field is already present.
-    /// * `userpass` - RPC API key. We should probably extract it automatically from the MM log.
-    /// * `local` - Function to start the MarketMaker in a local thread, instead of spawning a process.
-    /// It's required to manually add 127.0.0.* IPs aliases on Mac to make it properly work.
-    /// cf. https://superuser.com/a/458877, https://superuser.com/a/635327
+    /// Start a new MarketMaker node without any specific environment variables.
+    /// For more information see [`MarketMakerIt::start_with_envs`].
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn start(conf: Json, userpass: String, local: Option<LocalStart>) -> Result<MarketMakerIt, String> {
-        MarketMakerIt::start_with_envs(conf, userpass, local, &[])
+        block_on(MarketMakerIt::start_with_envs(conf, userpass, local, &[]))
+    }
+
+    /// Start a new MarketMaker node asynchronously without any specific environment variables.
+    /// For more information see [`MarketMakerIt::start_with_envs`].
+    pub async fn start_async(conf: Json, userpass: String, local: Option<LocalStart>) -> Result<MarketMakerIt, String> {
+        MarketMakerIt::start_with_envs(conf, userpass, local, &[]).await
     }
 
     /// Create a new temporary directory and start a new MarketMaker process there.
@@ -235,132 +235,116 @@ impl MarketMakerIt {
     /// * `envs` - The enviroment variables passed to the process
     /// It's required to manually add 127.0.0.* IPs aliases on Mac to make it properly work.
     /// cf. https://superuser.com/a/458877, https://superuser.com/a/635327
-    pub fn start_with_envs(
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn start_with_envs(
         mut conf: Json,
         userpass: String,
         local: Option<LocalStart>,
         envs: &[(&str, &str)],
     ) -> Result<MarketMakerIt, String> {
-        let ip: IpAddr = if conf["myipaddr"].is_null() {
-            // Generate an unique IP.
-            let mut attempts = 0;
-            let mut rng = super::small_rng();
-            loop {
-                let ip4 = Ipv4Addr::new(127, 0, 0, rng.gen_range(1, 255));
-                if attempts > 128 {
-                    return ERR!("Out of local IPs?");
-                }
-                let ip: IpAddr = ip4.clone().into();
-                let mut mm_ips = try_s!(MM_IPS.lock());
-                if mm_ips.contains_key(&ip) {
-                    attempts += 1;
-                    continue;
-                }
-                mm_ips.insert(ip, true);
-                conf["myipaddr"] = format!("{}", ip).into();
-                conf["rpcip"] = format!("{}", ip).into();
-                break ip;
-            }
-        } else {
-            // Just use the IP given in the `conf`.
-            let ip: IpAddr = try_s!(try_s!(conf["myipaddr"].as_str().ok_or("myipaddr is not a string")).parse());
-            let mut mm_ips = try_s!(MM_IPS.lock());
-            if mm_ips.contains_key(&ip) {
-                log! ({"MarketMakerIt] Warning, IP {} was already used.", ip})
-            }
-            mm_ips.insert(ip, true);
-            ip
+        let ip = try_s!(Self::myipaddr_from_conf(&mut conf));
+        let folder = new_mm2_temp_folder_path(Some(ip));
+        let db_dir = match conf["dbdir"].as_str() {
+            Some(path) => path.into(),
+            None => {
+                let dir = folder.join("DB");
+                conf["dbdir"] = dir.to_str().unwrap().into();
+                dir
+            },
         };
 
-        #[cfg(target_arch = "wasm32")]
-        {
-            let ctx = crate::mm_ctx::MmCtxBuilder::new().with_conf(conf).into_mm_arc();
-            let local = try_s!(local.ok_or("!local"));
-            local(ctx.clone());
-            Ok(MarketMakerIt { ctx, ip, userpass })
+        try_s!(fs::create_dir(&folder));
+        match fs::create_dir(db_dir) {
+            Ok(_) => (),
+            Err(ref ie) if ie.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return ERR!("{}", e),
+        };
+        let log_path = match conf["log"].as_str() {
+            Some(path) => path.into(),
+            None => {
+                let path = folder.join("mm2.log");
+                conf["log"] = path.to_str().unwrap().into();
+                path
+            },
+        };
+
+        // If `local` is provided
+        // then instead of spawning a process we start the MarketMaker in a local thread,
+        // allowing us to easily *debug* the tested MarketMaker code.
+        // Note that this should only be used while running a single test,
+        // using this option while running multiple tests (or multiple MarketMaker instances) is currently UB.
+        let pc = if let Some(local) = local {
+            local(folder.clone(), log_path.clone(), conf.clone());
+            None
+        } else {
+            let executable = try_s!(env::args().next().ok_or("No program name"));
+            let executable = try_s!(Path::new(&executable).canonicalize());
+            let log = try_s!(fs::File::create(&log_path));
+            let child = try_s!(Command::new(&executable)
+                .arg("test_mm_start")
+                .arg("--nocapture")
+                .current_dir(&folder)
+                .env("_MM2_TEST_CONF", try_s!(json::to_string(&conf)))
+                .env("MM2_UNBUFFERED_OUTPUT", "1")
+                .env("RUST_LOG", "debug")
+                .envs(envs.to_vec())
+                .stdout(try_s!(log.try_clone()))
+                .stderr(log)
+                .spawn());
+            Some(RaiiKill::from_handle(child))
+        };
+
+        let mut mm = MarketMakerIt {
+            folder,
+            ip,
+            log_path,
+            pc,
+            userpass,
+        };
+
+        try_s!(mm.startup_checks(&conf).await);
+        Ok(mm)
+    }
+
+    /// Start a new MarketMaker locally.
+    ///
+    /// * `conf` - The command-line configuration passed to the MarketMaker.
+    ///            Unique P2P in-memory port is injected as `p2p_in_memory_port` unless this field is already present.
+    /// * `userpass` - RPC API key. We should probably extract it automatically from the MM log.
+    /// * `local` - Function to start the MarketMaker locally. Required for nodes running in a browser.
+    /// * `envs` - The enviroment variables passed to the process.
+    ///            The argument is ignore for nodes running in a browser.
+    #[cfg(target_arch = "wasm32")]
+    pub async fn start_with_envs(
+        mut conf: Json,
+        userpass: String,
+        local: Option<LocalStart>,
+        _envs: &[(&str, &str)],
+    ) -> Result<MarketMakerIt, String> {
+        if conf["p2p_in_memory"].is_null() {
+            conf["p2p_in_memory"] = Json::Bool(true);
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let folder = new_mm2_temp_folder_path(Some(ip));
-            let db_dir = match conf["dbdir"].as_str() {
-                Some(path) => path.into(),
-                None => {
-                    let dir = folder.join("DB");
-                    conf["dbdir"] = dir.to_str().unwrap().into();
-                    dir
-                },
-            };
+        let i_am_seed = conf["i_am_seed"].as_bool().unwrap_or_default();
+        let p2p_in_memory_port_missed = conf["p2p_in_memory_port"].is_null();
+        if i_am_seed && p2p_in_memory_port_missed {
+            let mut rng = super::small_rng();
+            let new_p2p_port: u64 = rng.gen();
 
-            try_s!(fs::create_dir(&folder));
-            match fs::create_dir(db_dir) {
-                Ok(_) => (),
-                Err(ref ie) if ie.kind() == std::io::ErrorKind::AlreadyExists => (),
-                Err(e) => return ERR!("{}", e),
-            };
-            let log_path = match conf["log"].as_str() {
-                Some(path) => path.into(),
-                None => {
-                    let path = folder.join("mm2.log");
-                    conf["log"] = path.to_str().unwrap().into();
-                    path
-                },
-            };
-
-            // If `local` is provided
-            // then instead of spawning a process we start the MarketMaker in a local thread,
-            // allowing us to easily *debug* the tested MarketMaker code.
-            // Note that this should only be used while running a single test,
-            // using this option while running multiple tests (or multiple MarketMaker instances) is currently UB.
-            let pc = if let Some(local) = local {
-                local(folder.clone(), log_path.clone(), conf.clone());
-                None
-            } else {
-                let executable = try_s!(env::args().next().ok_or("No program name"));
-                let executable = try_s!(Path::new(&executable).canonicalize());
-                let log = try_s!(fs::File::create(&log_path));
-                let child = try_s!(Command::new(&executable)
-                    .arg("test_mm_start")
-                    .arg("--nocapture")
-                    .current_dir(&folder)
-                    .env("_MM2_TEST_CONF", try_s!(json::to_string(&conf)))
-                    .env("MM2_UNBUFFERED_OUTPUT", "1")
-                    .env("RUST_LOG", "debug")
-                    .envs(envs.to_vec())
-                    .stdout(try_s!(log.try_clone()))
-                    .stderr(log)
-                    .spawn());
-                Some(RaiiKill::from_handle(child))
-            };
-
-            let mut mm = MarketMakerIt {
-                folder,
-                ip,
-                log_path,
-                pc,
-                userpass,
-            };
-
-            let skip_startup_checks = conf["skip_startup_checks"].as_bool().unwrap_or_default();
-            if !skip_startup_checks {
-                let is_seed = conf["i_am_seed"].as_bool().unwrap_or_default();
-                if is_seed {
-                    try_s!(block_on(mm.wait_for_log(22., |log| log.contains("INFO Listening on"))));
-                }
-                try_s!(block_on(
-                    mm.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))
-                ));
-
-                let skip_seednodes_check = conf["skip_seednodes_check"].as_bool().unwrap_or_default();
-                if conf["seednodes"].as_array().is_some() && !skip_seednodes_check {
-                    // wait for at least 1 node to be added to relay mesh
-                    try_s!(block_on(mm.wait_for_log(22., |log| {
-                        log.contains("Completed IAmrelay handling for peer")
-                    })));
-                }
-            }
-            Ok(mm)
+            log!("Set 'p2p_in_memory_port' to "[new_p2p_port]);
+            conf["p2p_in_memory_port"] = Json::Number(new_p2p_port.into());
         }
+
+        let ctx = crate::mm_ctx::MmCtxBuilder::new()
+            .with_conf(conf.clone())
+            .with_test_db_namespace()
+            .into_mm_arc();
+        let local = try_s!(local.ok_or("!local"));
+        local(ctx.clone());
+
+        let mut mm = MarketMakerIt { ctx, userpass };
+        try_s!(mm.startup_checks(&conf).await);
+        Ok(mm)
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -388,7 +372,7 @@ impl MarketMakerIt {
             }
             if let Some(ref mut pc) = self.pc {
                 if !pc.running() {
-                    return ERR!("MM process terminated prematurely.");
+                    return ERR!("MM process terminated prematurely at: {:?}.", self.folder);
                 }
             }
             Timer::sleep(ms as f64 / 1000.).await
@@ -423,17 +407,7 @@ impl MarketMakerIt {
     where
         F: Fn(&str) -> bool,
     {
-        let start = now_float();
-        loop {
-            let tail = unsafe { std::str::from_utf8_unchecked(&crate::PROCESS_LOG_TAIL[..]) };
-            if pred(tail) {
-                return Ok(());
-            }
-            if now_float() - start > timeout_sec {
-                return ERR!("Timeout expired waiting for a log condition");
-            }
-            Timer::sleep(0.1).await
-        }
+        wait_for_log(&self.ctx, timeout_sec, pred).await
     }
 
     /// Invokes the locally running MM and returns its reply.
@@ -492,6 +466,21 @@ impl MarketMakerIt {
     #[cfg(target_arch = "wasm32")]
     pub fn mm_dump(&self) -> (RaiiDump, RaiiDump) { (RaiiDump {}, RaiiDump {}) }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn my_seed_addr(&self) -> String { format!("{}", self.ip) }
+
+    /// # Panic
+    ///
+    /// Panic if this instance is not a seed.
+    #[cfg(target_arch = "wasm32")]
+    pub fn my_seed_addr(&self) -> String {
+        let p2p_port = self
+            .ctx
+            .p2p_in_memory_port()
+            .expect("This instance is not a seed, so 'p2p_in_memory_port' is None");
+        format!("/memory/{}", p2p_port)
+    }
+
     /// Send the "stop" request to the locally running MM.
     pub async fn stop(&self) -> Result<(), String> {
         let (status, body, _headers) = match self.rpc(json! ({"userpass": self.userpass, "method": "stop"})).await {
@@ -511,6 +500,93 @@ impl MarketMakerIt {
             return ERR!("MM didn't accept a stop. body: {}", body);
         }
         Ok(())
+    }
+
+    /// Currently, we cannot wait for the `Completed IAmrelay handling for peer` log entry on WASM node,
+    /// because the P2P module logs to a global logger and doesn't log to the dashboard.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn check_seednodes(&mut self) -> Result<(), String> {
+        // wait for at least 1 node to be added to relay mesh
+        self.wait_for_log(22., |log| log.contains("Completed IAmrelay handling for peer"))
+            .await
+            .map_err(|e| ERRL!("{}", e))
+    }
+
+    /// Wait for the node to start listening to new P2P connections.
+    /// Please note the node is expected to be a seed.
+    ///
+    /// Currently, we cannot wait for the `INFO Listening on` log entry on WASM node,
+    /// because the P2P module logs to a global logger and doesn't log to the dashboard.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn wait_for_p2p_listen(&mut self) -> Result<(), String> {
+        self.wait_for_log(22., |log| log.contains("INFO Listening on"))
+            .await
+            .map_err(|e| ERRL!("{}", e))
+    }
+
+    /// Wait for the RPC to be up.
+    pub async fn wait_for_rpc_is_up(&mut self) -> Result<(), String> {
+        self.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))
+            .await
+            .map_err(|e| ERRL!("{}", e))
+    }
+
+    async fn startup_checks(&mut self, conf: &Json) -> Result<(), String> {
+        let skip_startup_checks = conf["skip_startup_checks"].as_bool().unwrap_or_default();
+        if skip_startup_checks {
+            return Ok(());
+        }
+
+        try_s!(self.wait_for_rpc_is_up().await);
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let is_seed = conf["i_am_seed"].as_bool().unwrap_or_default();
+            if is_seed {
+                try_s!(self.wait_for_p2p_listen().await);
+            }
+
+            let skip_seednodes_check = conf["skip_seednodes_check"].as_bool().unwrap_or_default();
+            if conf["seednodes"].as_array().is_some() && !skip_seednodes_check {
+                try_s!(self.check_seednodes().await);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn myipaddr_from_conf(conf: &mut Json) -> Result<IpAddr, String> {
+        if conf["myipaddr"].is_null() {
+            // Generate an unique IP.
+            let mut attempts = 0;
+            let mut rng = super::small_rng();
+            loop {
+                if attempts > 128 {
+                    return ERR!("Out of local IPs?");
+                }
+                let ip4 = Ipv4Addr::new(127, 0, 0, rng.gen_range(1, 255));
+                let ip = IpAddr::from(ip4);
+                let mut mm_ips = try_s!(MM_IPS.lock());
+                if mm_ips.contains_key(&ip) {
+                    attempts += 1;
+                    continue;
+                }
+                mm_ips.insert(ip, true);
+                conf["myipaddr"] = format!("{}", ip).into();
+                conf["rpcip"] = format!("{}", ip).into();
+                return Ok(ip);
+            }
+        }
+
+        // Just use the IP given in the `conf`.
+        let ip: IpAddr = try_s!(try_s!(conf["myipaddr"].as_str().ok_or("myipaddr is not a string")).parse());
+        let mut mm_ips = try_s!(MM_IPS.lock());
+        if mm_ips.contains_key(&ip) {
+            log! ({"MarketMakerIt] Warning, IP {} was already used.", ip})
+        }
+        mm_ips.insert(ip, true);
+        Ok(ip)
     }
 }
 
@@ -540,14 +616,16 @@ macro_rules! wait_log_re {
 }
 
 /// Busy-wait on the log until the `pred` returns `true` or `timeout_sec` expires.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn wait_for_log(log: &LogState, timeout_sec: f64, pred: &dyn Fn(&str) -> bool) -> Result<(), String> {
+pub async fn wait_for_log<F>(ctx: &MmArc, timeout_sec: f64, pred: F) -> Result<(), String>
+where
+    F: Fn(&str) -> bool,
+{
     let start = now_float();
-    let ms = 50.min((timeout_sec * 1000.) as u64 / 20 + 10);
+    let ms = 50.min((timeout_sec * 1000.) as u32 / 20 + 10);
     let mut buf = String::with_capacity(128);
     let mut found = false;
     loop {
-        log.with_tail(&mut |tail| {
+        ctx.log.with_tail(&mut |tail| {
             for en in tail {
                 if en.format(&mut buf).is_ok() && pred(&buf) {
                     found = true;
@@ -559,7 +637,7 @@ pub fn wait_for_log(log: &LogState, timeout_sec: f64, pred: &dyn Fn(&str) -> boo
             return Ok(());
         }
 
-        log.with_gravity_tail(&mut |tail| {
+        ctx.log.with_gravity_tail(&mut |tail| {
             for chunk in tail {
                 if pred(chunk) {
                     found = true;
@@ -574,7 +652,7 @@ pub fn wait_for_log(log: &LogState, timeout_sec: f64, pred: &dyn Fn(&str) -> boo
         if now_float() - start > timeout_sec {
             return ERR!("Timeout expired waiting for a log condition");
         }
-        thread::sleep(Duration::from_millis(ms));
+        Timer::sleep_ms(ms).await;
     }
 }
 
@@ -594,7 +672,8 @@ pub async fn common_wait_for_log_re(req: Bytes) -> Result<Vec<u8>, String> {
     // Run the blocking `wait_for_log` in the `POOL`.
     let (tx, rx) = oneshot::channel();
     try_s!(try_s!(POOL.lock()).spawn(async move {
-        let _ = tx.send(wait_for_log(&ctx.log, args.timeout_sec, &|line| re.is_match(line)));
+        let res = wait_for_log(&ctx, args.timeout_sec, |line| re.is_match(line)).await;
+        let _ = tx.send(res);
     }));
     try_s!(try_s!(rx.await));
 
@@ -604,7 +683,7 @@ pub async fn common_wait_for_log_re(req: Bytes) -> Result<Vec<u8>, String> {
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn wait_for_log_re(ctx: &MmArc, timeout_sec: f64, re_pred: &str) -> Result<(), String> {
     let re = try_s!(Regex::new(re_pred));
-    wait_for_log(&ctx.log, timeout_sec, &|line| re.is_match(line))
+    wait_for_log(&ctx, timeout_sec, |line| re.is_match(line)).await
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -686,7 +765,13 @@ pub fn register_wasm_log(level: LogLevel) {
 /// Asks MM to enable the given currency in electrum mode
 /// fresh list of servers at https://github.com/jl777/coins/blob/master/electrums/.
 pub async fn enable_electrum(mm: &MarketMakerIt, coin: &str, tx_history: bool, urls: &[&str]) -> Json {
-    let servers: Vec<_> = urls.iter().map(|url| json!({ "url": url })).collect();
+    let servers = urls.iter().map(|url| json!({ "url": url })).collect();
+    enable_electrum_json(mm, coin, tx_history, servers).await
+}
+
+/// Asks MM to enable the given currency in electrum mode
+/// fresh list of servers at https://github.com/jl777/coins/blob/master/electrums/.
+pub async fn enable_electrum_json(mm: &MarketMakerIt, coin: &str, tx_history: bool, servers: Vec<Json>) -> Json {
     let electrum = mm
         .rpc(json! ({
             "userpass": mm.userpass,
@@ -752,7 +837,24 @@ pub fn from_env_file(env: Vec<u8>) -> (Option<String>, Option<String>) {
     (passphrase, userpass)
 }
 
+#[macro_export]
+#[cfg(target_arch = "wasm32")]
+macro_rules! get_passphrase {
+    ($_env_file:literal, $env:literal) => {
+        option_env!($env).ok_or_else(|| ERRL!("No such '{}' environment variable", $env))
+    };
+}
+
+#[macro_export]
+#[cfg(not(target_arch = "wasm32"))]
+macro_rules! get_passphrase {
+    ($env_file:literal, $env:literal) => {
+        $crate::for_tests::get_passphrase(&$env_file, $env)
+    };
+}
+
 /// Reads passphrase from file or environment.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn get_passphrase(path: &dyn AsRef<Path>, env: &str) -> Result<String, String> {
     if let (Some(file_passphrase), _file_userpass) = from_env_file(try_s!(slurp(path))) {
         return Ok(file_passphrase);

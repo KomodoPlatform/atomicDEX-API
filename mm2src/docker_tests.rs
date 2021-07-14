@@ -1210,7 +1210,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_bob = MarketMakerIt::start_with_envs(
+        let mut mm_bob = block_on(MarketMakerIt::start_with_envs(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -1223,12 +1223,12 @@ mod docker_tests {
             "pass".to_string(),
             None,
             &[("MYCOIN_FEE_DISCOUNT", "")],
-        )
+        ))
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
         block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
-        let mut mm_alice = MarketMakerIt::start_with_envs(
+        let mut mm_alice = block_on(MarketMakerIt::start_with_envs(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -1241,7 +1241,7 @@ mod docker_tests {
             "pass".to_string(),
             None,
             &[("MYCOIN_FEE_DISCOUNT", "")],
-        )
+        ))
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
         block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();

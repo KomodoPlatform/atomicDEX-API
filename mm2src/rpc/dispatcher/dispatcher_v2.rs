@@ -30,7 +30,7 @@ pub async fn process_single_request(
     dispatcher(request, ctx).await
 }
 
-/// # Example
+/// # Examples
 ///
 /// ```rust
 /// async fn withdraw(request: WithdrawRequest) -> Result<TransactionDetails, MmError<WithdrawError>>

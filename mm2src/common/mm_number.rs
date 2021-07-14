@@ -1,7 +1,7 @@
 use crate::big_int_str::BigIntStr;
 use core::ops::{Add, AddAssign, Div, Mul, Sub};
 use num_traits::{Pow, Zero};
-use serde::{de, Deserialize, Deserializer, Serialize};
+use serde::{de, Deserialize, Deserializer};
 use serde_json::value::RawValue;
 use std::str::FromStr;
 

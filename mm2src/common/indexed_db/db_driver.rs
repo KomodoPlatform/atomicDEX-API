@@ -1,15 +1,22 @@
+//! The representation of [Indexed DB](https://developer.mozilla.org/en-US/docs/Web/API/IndexedDB_API).
+//! This module consists of low-level Rust wrappers over basic JS structures like `IDBDatabase`, `IDBTransaction`, `IDBObjectStore` etc.
+//!
+//! # Usage
+//!
+//! Since the wrappers represented below are not `Send`, it's strongly recommended NOT to use them directly.
+//! Please consider using a higher-level interface from `indexed_db.rs`.
+
 use crate::log::{debug, error};
 use crate::mm_error::prelude::*;
-use crate::{panic_w, stringify_js_error, WasmUnwrapErrExt, WasmUnwrapExt};
+use crate::stringify_js_error;
 use derive_more::Display;
 use futures::channel::{mpsc, oneshot};
 use futures::StreamExt;
 use js_sys::Array;
-use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde_json::Value as Json;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::marker::PhantomData;
+use std::iter::IntoIterator;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use wasm_bindgen::prelude::*;
@@ -28,13 +35,13 @@ pub type OnUpgradeResult<T> = Result<T, MmError<OnUpgradeError>>;
 pub type InitDbResult<T> = Result<T, MmError<InitDbError>>;
 pub type DbTransactionResult<T> = Result<T, MmError<DbTransactionError>>;
 
-type OnUpgradeNeededCb = Box<dyn FnOnce(&DbUpgrader, u32, u32) -> OnUpgradeResult<()> + Send>;
+pub(super) type OnUpgradeNeededCb = Box<dyn FnOnce(&DbUpgrader, u32, u32) -> OnUpgradeResult<()> + Send>;
 
 #[derive(Debug, Display, PartialEq)]
 pub enum InitDbError {
     #[display(fmt = "Cannot initialize a Database without tables")]
     EmptyTableList,
-    #[display(fmt = "Database {} is open already", db_name)]
+    #[display(fmt = "Database '{}' is open already", db_name)]
     DbIsOpenAlready { db_name: String },
     #[display(fmt = "It seems this browser doesn't support 'IndexedDb': {}", _0)]
     NotSupported(String),
@@ -69,7 +76,7 @@ pub enum OnUpgradeError {
     ErrorCreatingIndex { index: String, description: String },
 }
 
-#[derive(Debug, Display)]
+#[derive(Debug, Display, PartialEq)]
 pub enum DbTransactionError {
     #[display(fmt = "No such table '{}'", table)]
     NoSuchTable { table: String },
@@ -77,6 +84,8 @@ pub enum DbTransactionError {
     ErrorCreatingTransaction(String),
     #[display(fmt = "Error opening the '{}' table: {}", table, description)]
     ErrorOpeningTable { table: String, description: String },
+    #[display(fmt = "Error serializing the '{}' index: {:?}", index, description)]
+    ErrorSerializingIndex { index: String, description: String },
     #[display(fmt = "Error serializing an item: {:?}", _0)]
     ErrorSerializingItem(String),
     #[display(fmt = "Error deserializing an item: {:?}", _0)]
@@ -92,7 +101,7 @@ pub enum DbTransactionError {
     #[display(fmt = "Invalid index '{}:{}': {:?}", index, index_value, description)]
     InvalidIndex {
         index: String,
-        index_value: String,
+        index_value: Json,
         description: String,
     },
     #[display(fmt = "Error occurred due to an unexpected state: {:?}", _0)]
@@ -101,37 +110,40 @@ pub enum DbTransactionError {
     TransactionAborted,
 }
 
-pub struct IndexedDbBuilder {
+pub(super) struct IdbDatabaseBuilder {
     db_name: String,
     db_version: u32,
     tables: HashMap<String, OnUpgradeNeededCb>,
 }
 
-impl IndexedDbBuilder {
-    pub fn new(db_name: &str) -> IndexedDbBuilder {
-        IndexedDbBuilder {
+impl IdbDatabaseBuilder {
+    pub fn new(db_name: &str) -> IdbDatabaseBuilder {
+        IdbDatabaseBuilder {
             db_name: db_name.to_owned(),
             db_version: 1,
             tables: HashMap::new(),
         }
     }
 
-    pub fn with_version(mut self, db_version: u32) -> IndexedDbBuilder {
+    pub fn with_version(mut self, db_version: u32) -> IdbDatabaseBuilder {
         self.db_version = db_version;
         self
     }
 
-    pub fn with_table<Table: TableSignature>(mut self) -> IndexedDbBuilder {
-        let on_upgrade_needed_cb = Box::new(Table::on_upgrade_needed);
-        self.tables.insert(Table::table_name().to_owned(), on_upgrade_needed_cb);
+    pub fn with_tables<Tables>(mut self, tables: Tables) -> IdbDatabaseBuilder
+    where
+        Tables: IntoIterator<Item = (String, OnUpgradeNeededCb)>,
+    {
+        self.tables.extend(tables);
         self
     }
 
-    pub async fn init(self) -> InitDbResult<IndexedDb> {
+    pub async fn build(self) -> InitDbResult<IdbDatabaseImpl> {
         Self::check_if_db_is_not_open(&self.db_name)?;
         let (table_names, on_upgrade_needed_handlers) = Self::tables_into_parts(self.tables)?;
+        debug!("Open '{}' database with tables: {:?}", self.db_name, table_names);
 
-        let window = web_sys::window().expect_w("!window");
+        let window = web_sys::window().expect("!window");
         let indexed_db = match window.indexed_db() {
             Ok(Some(db)) => db,
             Ok(None) => return MmError::err(InitDbError::NotSupported("Unknown error".to_owned())),
@@ -163,7 +175,7 @@ impl IndexedDbBuilder {
                     let db = Self::get_db_from_request(&db_request)?;
                     Self::cache_open_db(self.db_name.clone());
 
-                    return Ok(IndexedDb {
+                    return Ok(IdbDatabaseImpl {
                         db,
                         db_name: self.db_name,
                         tables: table_names,
@@ -219,12 +231,12 @@ impl IndexedDbBuilder {
     }
 
     fn cache_open_db(db_name: String) {
-        let mut open_databases = OPEN_DATABASES.lock().expect_w("!OPEN_DATABASES.lock()");
+        let mut open_databases = OPEN_DATABASES.lock().expect("!OPEN_DATABASES.lock()");
         open_databases.insert(db_name);
     }
 
     fn check_if_db_is_not_open(db_name: &str) -> InitDbResult<()> {
-        let open_databases = OPEN_DATABASES.lock().expect_w("!OPEN_DATABASES.lock()");
+        let open_databases = OPEN_DATABASES.lock().expect("!OPEN_DATABASES.lock()");
         if open_databases.contains(db_name) {
             MmError::err(InitDbError::DbIsOpenAlready {
                 db_name: db_name.to_owned(),
@@ -281,15 +293,15 @@ impl IndexedDbBuilder {
     }
 }
 
-pub struct IndexedDb {
+pub(super) struct IdbDatabaseImpl {
     db: IdbDatabase,
     db_name: String,
     tables: HashSet<String>,
 }
 
-impl !Send for IndexedDb {}
+impl !Send for IdbDatabaseImpl {}
 
-impl fmt::Debug for IndexedDb {
+impl fmt::Debug for IdbDatabaseImpl {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -299,8 +311,8 @@ impl fmt::Debug for IndexedDb {
     }
 }
 
-impl IndexedDb {
-    pub fn transaction(&self) -> DbTransactionResult<DbTransaction> {
+impl IdbDatabaseImpl {
+    pub fn transaction(&self) -> DbTransactionResult<IdbTransactionImpl> {
         let store_names = Array::new();
         for table in self.tables.iter() {
             store_names.push(&JsValue::from(table));
@@ -310,48 +322,46 @@ impl IndexedDb {
             .db
             .transaction_with_str_sequence_and_mode(&store_names, IdbTransactionMode::Readwrite)
         {
-            Ok(transaction) => Ok(DbTransaction::init(transaction, self.tables.clone())),
+            Ok(transaction) => Ok(IdbTransactionImpl::init(transaction, self.tables.clone())),
             Err(e) => MmError::err(DbTransactionError::ErrorCreatingTransaction(stringify_js_error(&e))),
         }
     }
 }
 
-impl Drop for IndexedDb {
+impl Drop for IdbDatabaseImpl {
     fn drop(&mut self) {
         self.db.close();
-        let mut open_databases = OPEN_DATABASES.lock().expect_w("!OPEN_DATABASES.lock()");
+        let mut open_databases = OPEN_DATABASES.lock().expect("!OPEN_DATABASES.lock()");
         open_databases.remove(&self.db_name);
     }
 }
 
-pub struct DbTransaction {
+pub(super) struct IdbTransactionImpl {
     transaction: IdbTransaction,
     tables: HashSet<String>,
     aborted: Arc<AtomicBool>,
     complete_rx: oneshot::Receiver<Result<JsValue, JsValue>>,
 }
 
-impl !Send for DbTransaction {}
+impl !Send for IdbTransactionImpl {}
 
-impl DbTransaction {
+impl IdbTransactionImpl {
     pub fn aborted(&self) -> bool { self.aborted.load(Ordering::Relaxed) }
 
-    pub fn open_table<Table: TableSignature>(&self) -> DbTransactionResult<DbTable<Table>> {
+    pub fn open_table(&self, table_name: &str) -> DbTransactionResult<IdbObjectStoreImpl> {
         if self.aborted.load(Ordering::Relaxed) {
             return MmError::err(DbTransactionError::TransactionAborted);
         }
 
-        let table_name = Table::table_name();
         if !self.tables.contains(table_name) {
             let table = table_name.to_owned();
             return MmError::err(DbTransactionError::NoSuchTable { table });
         }
 
         match self.transaction.object_store(table_name) {
-            Ok(object_store) => Ok(DbTable {
+            Ok(object_store) => Ok(IdbObjectStoreImpl {
                 object_store,
                 aborted: self.aborted.clone(),
-                phantom: PhantomData::default(),
             }),
             Err(e) => MmError::err(DbTransactionError::ErrorOpeningTable {
                 table: table_name.to_owned(),
@@ -365,17 +375,14 @@ impl DbTransaction {
             return MmError::err(DbTransactionError::TransactionAborted);
         }
 
-        let result = self
-            .complete_rx
-            .await
-            .expect_w("The complete channel must not be closed");
+        let result = self.complete_rx.await.expect("The complete channel must not be closed");
         match result {
             Ok(_event) => Ok(()),
             Err(_error_event) => return MmError::err(DbTransactionError::TransactionAborted),
         }
     }
 
-    fn init(transaction: IdbTransaction, tables: HashSet<String>) -> DbTransaction {
+    fn init(transaction: IdbTransaction, tables: HashSet<String>) -> IdbTransactionImpl {
         let (complete_tx, complete_rx) = oneshot::channel();
         let (event_tx, mut event_rx) = mpsc::channel(2);
 
@@ -388,7 +395,7 @@ impl DbTransaction {
 
         // move the closures into this async block to keep it alive until either `oncomplete` or `onabort` handler is called
         let fut = async move {
-            let complete_or_abort = event_rx.next().await.expect_w("The event channel must not be closed");
+            let complete_or_abort = event_rx.next().await.expect("The event channel must not be closed");
             // ignore if the receiver is closed
             let _res = complete_tx.send(complete_or_abort);
 
@@ -398,7 +405,7 @@ impl DbTransaction {
         };
 
         wasm_bindgen_futures::spawn_local(fut);
-        DbTransaction {
+        IdbTransactionImpl {
             transaction,
             tables,
             aborted: Arc::new(AtomicBool::new(false)),
@@ -407,18 +414,17 @@ impl DbTransaction {
     }
 }
 
-pub struct DbTable<'a, T: TableSignature> {
+pub(super) struct IdbObjectStoreImpl {
     object_store: IdbObjectStore,
     aborted: Arc<AtomicBool>,
-    phantom: PhantomData<&'a T>,
 }
 
-impl<'a, T: TableSignature> !Send for DbTable<'a, T> {}
+impl !Send for IdbObjectStoreImpl {}
 
-impl<'a, T: TableSignature> DbTable<'a, T> {
+impl IdbObjectStoreImpl {
     pub fn aborted(&self) -> bool { self.aborted.load(Ordering::Relaxed) }
 
-    pub async fn add_item(&self, item: &T) -> DbTransactionResult<ItemId> {
+    pub async fn add_item(&self, item: &Json) -> DbTransactionResult<ItemId> {
         if self.aborted.load(Ordering::Relaxed) {
             return MmError::err(DbTransactionError::TransactionAborted);
         }
@@ -443,15 +449,17 @@ impl<'a, T: TableSignature> DbTable<'a, T> {
         Self::item_id_from_completed_request(&add_request)
     }
 
-    pub async fn get_items(&self, index_str: &str, index_value_str: &str) -> DbTransactionResult<Vec<(ItemId, T)>> {
+    pub async fn get_items(&self, index_str: &str, index_value: Json) -> DbTransactionResult<Vec<(ItemId, Json)>> {
         if self.aborted.load(Ordering::Relaxed) {
             return MmError::err(DbTransactionError::TransactionAborted);
         }
 
         let index = index_str.to_owned();
-        let index_value = index_value_str.to_owned();
-
-        let index_value_js = JsValue::from(index_value_str);
+        let index_value_js =
+            JsValue::from_serde(&index_value).map_to_mm(|e| DbTransactionError::ErrorSerializingIndex {
+                index: index.clone(),
+                description: e.to_string(),
+            })?;
 
         let db_index = match self.object_store.index(index_str) {
             Ok(index) => index,
@@ -477,15 +485,17 @@ impl<'a, T: TableSignature> DbTable<'a, T> {
         Self::items_from_completed_request(&get_request)
     }
 
-    pub async fn get_item_ids(&self, index_str: &str, index_value_str: &str) -> DbTransactionResult<Vec<ItemId>> {
+    pub async fn get_item_ids(&self, index_str: &str, index_value: Json) -> DbTransactionResult<Vec<ItemId>> {
         if self.aborted.load(Ordering::Relaxed) {
             return MmError::err(DbTransactionError::TransactionAborted);
         }
 
         let index = index_str.to_owned();
-        let index_value = index_value_str.to_owned();
-
-        let index_value_js = JsValue::from(index_value_str);
+        let index_value_js =
+            JsValue::from_serde(&index_value).map_to_mm(|e| DbTransactionError::ErrorSerializingIndex {
+                index: index.clone(),
+                description: e.to_string(),
+            })?;
 
         let db_index = match self.object_store.index(index_str) {
             Ok(index) => index,
@@ -511,7 +521,7 @@ impl<'a, T: TableSignature> DbTable<'a, T> {
         Self::item_ids_from_completed_request(&get_request)
     }
 
-    pub async fn get_all_items(&self) -> DbTransactionResult<Vec<(ItemId, T)>> {
+    pub async fn get_all_items(&self) -> DbTransactionResult<Vec<(ItemId, Json)>> {
         if self.aborted.load(Ordering::Relaxed) {
             return MmError::err(DbTransactionError::TransactionAborted);
         }
@@ -530,7 +540,7 @@ impl<'a, T: TableSignature> DbTable<'a, T> {
         Self::items_from_completed_request(&get_request)
     }
 
-    pub async fn replace_item(&self, _item_id: ItemId, item: T) -> DbTransactionResult<ItemId> {
+    pub async fn replace_item(&self, _item_id: ItemId, item: Json) -> DbTransactionResult<ItemId> {
         if self.aborted.load(Ordering::Relaxed) {
             return MmError::err(DbTransactionError::TransactionAborted);
         }
@@ -603,7 +613,7 @@ impl<'a, T: TableSignature> DbTable<'a, T> {
         request.set_onsuccess(Some(onsuccess_closure.as_ref().unchecked_ref()));
         request.set_onerror(Some(onerror_closure.as_ref().unchecked_ref()));
 
-        rx.next().await.expect_w("The request event channel must not be closed")
+        rx.next().await.expect("The request event channel must not be closed")
     }
 
     fn item_id_from_completed_request(request: &IdbRequest) -> DbTransactionResult<ItemId> {
@@ -617,7 +627,7 @@ impl<'a, T: TableSignature> DbTable<'a, T> {
             .map_to_mm(|e| DbTransactionError::ErrorDeserializingItem(e.to_string()))
     }
 
-    fn items_from_completed_request(request: &IdbRequest) -> DbTransactionResult<Vec<(ItemId, T)>> {
+    fn items_from_completed_request(request: &IdbRequest) -> DbTransactionResult<Vec<(ItemId, Json)>> {
         let result_js_value = match request.result() {
             Ok(res) => res,
             Err(e) => return MmError::err(DbTransactionError::UnexpectedState(stringify_js_error(&e))),
@@ -627,7 +637,7 @@ impl<'a, T: TableSignature> DbTable<'a, T> {
             return Ok(Vec::new());
         }
 
-        let items: Vec<InternalItem<T>> = match result_js_value.into_serde() {
+        let items: Vec<InternalItem> = match result_js_value.into_serde() {
             Ok(items) => items,
             Err(e) => return MmError::err(DbTransactionError::ErrorDeserializingItem(e.to_string())),
         };
@@ -711,17 +721,11 @@ impl TableUpgrader {
     }
 }
 
-pub trait TableSignature: DeserializeOwned + Serialize + 'static {
-    fn table_name() -> &'static str;
-
-    fn on_upgrade_needed(upgrader: &DbUpgrader, old_version: u32, new_version: u32) -> OnUpgradeResult<()>;
-}
-
 #[derive(Debug, Deserialize, Serialize)]
-struct InternalItem<T> {
+struct InternalItem {
     _item_id: ItemId,
     #[serde(flatten)]
-    item: T,
+    item: Json,
 }
 
 #[derive(Debug)]
@@ -745,397 +749,4 @@ where
             error!("Error sending the '{:?}' event: {}", event, error);
         }
     })
-}
-
-mod tests {
-    use super::*;
-    use crate::for_tests::register_wasm_log;
-    use crate::log::LogLevel;
-    use wasm_bindgen_test::*;
-
-    wasm_bindgen_test_configure!(run_in_browser);
-
-    #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-    #[serde(deny_unknown_fields)]
-    struct TxTable {
-        ticker: String,
-        tx_hash: String,
-        block_height: u64,
-    }
-
-    impl TableSignature for TxTable {
-        fn table_name() -> &'static str { "tx_table" }
-
-        fn on_upgrade_needed(upgrader: &DbUpgrader, old_version: u32, _new_version: u32) -> OnUpgradeResult<()> {
-            if old_version > 0 {
-                // the table is initialized already
-                return Ok(());
-            }
-            let table_upgrader = upgrader.create_table("tx_table")?;
-            table_upgrader.create_index("ticker", false)?;
-            table_upgrader.create_index("tx_hash", true)
-        }
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_add_get_item() {
-        const DB_NAME: &str = "TEST_ADD_GET_ITEM";
-        const DB_VERSION: u32 = 1;
-
-        let rick_tx_1 = TxTable {
-            ticker: "RICK".to_owned(),
-            tx_hash: "0a0fda88364b960000f445351fe7678317a1e0c80584de0413377ede00ba696f".to_owned(),
-            block_height: 10000,
-        };
-        let rick_tx_2 = TxTable {
-            ticker: "RICK".to_owned(),
-            tx_hash: "ba881ecca15b5d4593f14f25debbcdfe25f101fd2e9cf8d0b5d92d19813d4424".to_owned(),
-            block_height: 10000,
-        };
-        let morty_tx_1 = TxTable {
-            ticker: "MORTY".to_owned(),
-            tx_hash: "1fc789133239260ed16361190a026a88cab2243935f02f1ccd794f1d06a22246".to_owned(),
-            block_height: 20000,
-        };
-
-        register_wasm_log(LogLevel::Debug);
-
-        let db = IndexedDbBuilder::new(DB_NAME)
-            .with_version(DB_VERSION)
-            .with_table::<TxTable>()
-            .init()
-            .await
-            .expect_w("!IndexedDb::init");
-        let transaction = db.transaction().expect_w("!IndexedDb::transaction()");
-        let table = transaction
-            .open_table::<TxTable>()
-            .expect_w("!DbTransaction::open_table");
-
-        let rick_tx_1_id = table
-            .add_item(&rick_tx_1)
-            .await
-            .expect_w("!Couldn't add a 'RICK' transaction");
-        let rick_tx_2_id = table
-            .add_item(&rick_tx_2)
-            .await
-            .expect_w("!Couldn't add a 'RICK' transaction with the different 'tx_hash'");
-        let morty_tx_1_id = table
-            .add_item(&morty_tx_1)
-            .await
-            .expect_w("!Couldn't add a 'MORTY' transaction");
-        assert!(rick_tx_1_id != rick_tx_2_id && rick_tx_2_id != morty_tx_1_id);
-
-        let actual_rick_txs = table
-            .get_items("ticker", "RICK")
-            .await
-            .expect_w("!Couldn't get items by the index 'ticker=RICK'");
-        let expected_rick_txs = vec![(rick_tx_1_id, rick_tx_1), (rick_tx_2_id, rick_tx_2.clone())];
-        assert_eq!(actual_rick_txs, expected_rick_txs);
-
-        let actual_rick_tx_ids = table
-            .get_item_ids("ticker", "RICK")
-            .await
-            .expect_w("Couldn't get item ids by the index 'ticker=RICK'");
-        let expected_rick_tx_ids = vec![rick_tx_1_id, rick_tx_2_id];
-        assert_eq!(actual_rick_tx_ids, expected_rick_tx_ids);
-
-        let actual_rick_2_tx = table
-            .get_items(
-                "tx_hash",
-                "ba881ecca15b5d4593f14f25debbcdfe25f101fd2e9cf8d0b5d92d19813d4424",
-            )
-            .await
-            .expect_w("!Couldn't get items by the index 'tx_hash'");
-        let expected_rick_txs = vec![(rick_tx_2_id, rick_tx_2)];
-        assert_eq!(actual_rick_2_tx, expected_rick_txs);
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_replace_item() {
-        const DB_NAME: &str = "TEST_REPLACE_ITEM";
-        const DB_VERSION: u32 = 1;
-
-        let rick_tx_1 = TxTable {
-            ticker: "RICK".to_owned(),
-            tx_hash: "0a0fda88364b960000f445351fe7678317a1e0c80584de0413377ede00ba696f".to_owned(),
-            block_height: 10000,
-        };
-        let rick_tx_2 = TxTable {
-            ticker: "RICK".to_owned(),
-            tx_hash: "ba881ecca15b5d4593f14f25debbcdfe25f101fd2e9cf8d0b5d92d19813d4424".to_owned(),
-            block_height: 10000,
-        };
-        let rick_tx_1_updated = TxTable {
-            ticker: "RICK".to_owned(),
-            tx_hash: "0a0fda88364b960000f445351fe7678317a1e0c80584de0413377ede00ba696f".to_owned(),
-            block_height: 20000,
-        };
-
-        register_wasm_log(LogLevel::Debug);
-
-        let db = IndexedDbBuilder::new(DB_NAME)
-            .with_version(DB_VERSION)
-            .with_table::<TxTable>()
-            .init()
-            .await
-            .expect_w("!IndexedDb::init");
-        let transaction = db.transaction().expect_w("!IndexedDb::transaction()");
-        let table = transaction
-            .open_table::<TxTable>()
-            .expect_w("!DbTransaction::open_table");
-
-        let rick_tx_1_id = table.add_item(&rick_tx_1).await.expect_w("Couldn't add an item");
-        let rick_tx_2_id = table.add_item(&rick_tx_2).await.expect_w("Couldn't add an item");
-
-        // Wait for the transaction to complete to save the changes to the database.
-        transaction
-            .wait_for_complete()
-            .await
-            .expect_w("Error waiting for the transaction to complete");
-
-        // Open new transaction.
-        let transaction = db.transaction().expect_w("!IndexedDb::transaction()");
-        let table = transaction
-            .open_table::<TxTable>()
-            .expect_w("!DbTransaction::open_table");
-
-        // Try to add the updated RICK tx item with the same [`TxTable::tx_hash`].
-        // [`TxTable::tx_hash`] is a unique index, so this operation must fail.
-        let err = table
-            .add_item(&rick_tx_1_updated)
-            .await
-            .expect_err_w("'DbTable::add_item' should have failed");
-        match err.into_inner() {
-            DbTransactionError::ErrorUploadingItem(err) => debug!("error: {}", err),
-            e => panic_w(&format!(
-                "Expected 'DbTransactionError::ErrorUploadingItem', found: {:?}",
-                e
-            )),
-        }
-        assert!(transaction.aborted() && table.aborted());
-
-        // But we should be able to replace the updated item.
-        // Since the last operation failed, we have to reopen the transaction.
-        let transaction = db.transaction().expect_w("!IndexedDb::transaction()");
-        let table = transaction
-            .open_table::<TxTable>()
-            .expect_w("!DbTransaction::open_table");
-
-        let rick_tx_1_updated_id = table
-            .replace_item(rick_tx_1_id, rick_tx_1_updated.clone())
-            .await
-            .expect_w("!Couldn't replace an item");
-        assert_eq!(rick_tx_1_updated_id, rick_tx_1_id);
-
-        let actual_rick_txs = table
-            .get_items("ticker", "RICK")
-            .await
-            .expect_w("Couldn't get items by the index 'ticker=RICK'");
-        assert_eq!(actual_rick_txs, vec![
-            (rick_tx_1_id, rick_tx_1_updated),
-            (rick_tx_2_id, rick_tx_2)
-        ]);
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_delete_item() {
-        const DB_NAME: &str = "TEST_DELETE_ITEM";
-        const DB_VERSION: u32 = 1;
-
-        let rick_tx_1 = TxTable {
-            ticker: "RICK".to_owned(),
-            tx_hash: "0a0fda88364b960000f445351fe7678317a1e0c80584de0413377ede00ba696f".to_owned(),
-            block_height: 10000,
-        };
-        let rick_tx_2 = TxTable {
-            ticker: "RICK".to_owned(),
-            tx_hash: "ba881ecca15b5d4593f14f25debbcdfe25f101fd2e9cf8d0b5d92d19813d4424".to_owned(),
-            block_height: 10000,
-        };
-
-        register_wasm_log(LogLevel::Debug);
-
-        let db = IndexedDbBuilder::new(DB_NAME)
-            .with_version(DB_VERSION)
-            .with_table::<TxTable>()
-            .init()
-            .await
-            .expect_w("!IndexedDb::init");
-        let transaction = db.transaction().expect_w("!IndexedDb::transaction()");
-        let table = transaction
-            .open_table::<TxTable>()
-            .expect_w("!DbTransaction::open_table");
-
-        let rick_tx_1_id = table.add_item(&rick_tx_1).await.expect_w("Couldn't add an item");
-        let rick_tx_2_id = table.add_item(&rick_tx_2).await.expect_w("Couldn't add an item");
-
-        table
-            .delete_item(rick_tx_1_id)
-            .await
-            .expect_w("Couldn't delete an item");
-
-        let actual_rick_txs = table
-            .get_items("ticker", "RICK")
-            .await
-            .expect_w("Couldn't get items by the index 'ticker=RICK'");
-        assert_eq!(actual_rick_txs, vec![(rick_tx_2_id, rick_tx_2)]);
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_clear() {
-        const DB_NAME: &str = "TEST_CLEAR";
-        const DB_VERSION: u32 = 1;
-
-        let rick_tx_1 = TxTable {
-            ticker: "RICK".to_owned(),
-            tx_hash: "0a0fda88364b960000f445351fe7678317a1e0c80584de0413377ede00ba696f".to_owned(),
-            block_height: 10000,
-        };
-        let rick_tx_2 = TxTable {
-            ticker: "RICK".to_owned(),
-            tx_hash: "ba881ecca15b5d4593f14f25debbcdfe25f101fd2e9cf8d0b5d92d19813d4424".to_owned(),
-            block_height: 10000,
-        };
-
-        register_wasm_log(LogLevel::Debug);
-
-        let db = IndexedDbBuilder::new(DB_NAME)
-            .with_version(DB_VERSION)
-            .with_table::<TxTable>()
-            .init()
-            .await
-            .expect_w("!IndexedDb::init");
-        let transaction = db.transaction().expect_w("!IndexedDb::transaction()");
-        let table = transaction
-            .open_table::<TxTable>()
-            .expect_w("!DbTransaction::open_table");
-
-        let _rick_tx_1_id = table.add_item(&rick_tx_1).await.expect_w("Couldn't add an item");
-        let _rick_tx_2_id = table.add_item(&rick_tx_2).await.expect_w("Couldn't add an item");
-
-        table.clear().await.expect_w("Couldn't clear the database");
-
-        let actual_rick_txs = table
-            .get_items("ticker", "RICK")
-            .await
-            .expect_w("Couldn't get items by the index 'ticker=RICK'");
-        assert!(actual_rick_txs.is_empty());
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_upgrade_needed() {
-        const DB_NAME: &str = "TEST_UPGRADE_NEEDED";
-
-        lazy_static! {
-            static ref LAST_VERSIONS: Mutex<Option<(u32, u32)>> = Mutex::new(None);
-        }
-
-        #[derive(Serialize, Deserialize)]
-        struct UpgradableTable;
-
-        impl TableSignature for UpgradableTable {
-            fn table_name() -> &'static str { "upgradable_table" }
-
-            fn on_upgrade_needed(upgrader: &DbUpgrader, old_version: u32, new_version: u32) -> OnUpgradeResult<()> {
-                let mut versions = LAST_VERSIONS.lock().expect_w("!old_new_versions.lock()");
-                *versions = Some((old_version, new_version));
-
-                match (old_version, new_version) {
-                    (0, 1) => {
-                        let table = upgrader.create_table("upgradable_table")?;
-                        table.create_index("first_index", false)?;
-                    },
-                    (0, 2) => {
-                        let table = upgrader.create_table("upgradable_table")?;
-                        table.create_index("first_index", false)?;
-                        table.create_index("second_index", false)?;
-                    },
-                    (1, 2) => {
-                        let table = upgrader.open_table("upgradable_table")?;
-                        table.create_index("second_index", false)?;
-                    },
-                    v => panic_w(&format!("Unexpected old, new versions: {:?}", v)),
-                }
-                Ok(())
-            }
-        }
-
-        async fn init_and_check(version: u32, expected_old_new_versions: Option<(u32, u32)>) -> Result<(), String> {
-            let mut versions = LAST_VERSIONS.lock().expect_w("!LAST_VERSIONS.lock()");
-            *versions = None;
-            drop(versions);
-
-            let _db = IndexedDbBuilder::new(DB_NAME)
-                .with_version(version)
-                .with_table::<UpgradableTable>()
-                .init()
-                .await
-                .map_err(|e| format!("{}", e))?;
-
-            let actual_versions = LAST_VERSIONS.lock().unwrap_w();
-            if *actual_versions == expected_old_new_versions {
-                Ok(())
-            } else {
-                Err(format!(
-                    "Expected {:?}, found {:?}",
-                    expected_old_new_versions, actual_versions
-                ))
-            }
-        }
-
-        register_wasm_log(LogLevel::Debug);
-
-        init_and_check(1, Some((0, 1))).await.unwrap_w();
-        init_and_check(2, Some((1, 2))).await.unwrap_w();
-        // the same 2 version, `on_upgrade_needed` must not be called
-        init_and_check(2, None).await.unwrap_w();
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_open_twice() {
-        const DB_NAME: &str = "TEST_OPEN_TWICE";
-        const DB_VERSION: u32 = 1;
-
-        register_wasm_log(LogLevel::Debug);
-
-        let _db = IndexedDbBuilder::new(DB_NAME)
-            .with_version(DB_VERSION)
-            .with_table::<TxTable>()
-            .init()
-            .await
-            .expect_w("!IndexedDb::init first time");
-
-        let err = IndexedDbBuilder::new(DB_NAME)
-            .with_version(DB_VERSION + 1)
-            .with_table::<TxTable>()
-            .init()
-            .await
-            .expect_err_w("!IndexedDb::init should have failed");
-        assert_eq!(err.into_inner(), InitDbError::DbIsOpenAlready {
-            db_name: DB_NAME.to_owned()
-        });
-    }
-
-    #[wasm_bindgen_test]
-    async fn test_open_close_and_open() {
-        const DB_NAME: &str = "TEST_OPEN_CLOSE_AND_OPEN";
-        const DB_VERSION: u32 = 1;
-
-        register_wasm_log(LogLevel::Debug);
-
-        let db = IndexedDbBuilder::new(DB_NAME)
-            .with_version(DB_VERSION)
-            .with_table::<TxTable>()
-            .init()
-            .await
-            .expect_w("!IndexedDb::init first time");
-        drop(db);
-
-        let _db = IndexedDbBuilder::new(DB_NAME)
-            .with_version(DB_VERSION)
-            .with_table::<TxTable>()
-            .init()
-            .await
-            .expect_w("!IndexedDb::init second time");
-    }
 }

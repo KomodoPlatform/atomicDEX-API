@@ -2337,8 +2337,10 @@ fn lp_connect_start_bob(ctx: MmArc, maker_match: MakerMatch, maker_order: MakerO
             None => AtomicLocktimeVersion::V1,
         };
         let lock_time = lp_atomic_locktime(maker_coin.ticker(), taker_coin.ticker(), atomic_locktime_v);
-        log::info!(
-            "Entering the maker_swap_loop {}/{} with uuid: {}",
+        log_tag!(
+            ctx,
+            "";
+            fmt = "Entering the maker_swap_loop {}/{} with uuid: {}",
             maker_coin.ticker(),
             taker_coin.ticker(),
             uuid
@@ -2424,8 +2426,10 @@ fn lp_connected_alice(ctx: MmArc, taker_request: TakerRequest, taker_match: Take
             None => AtomicLocktimeVersion::V1,
         };
         let locktime = lp_atomic_locktime(maker_coin.ticker(), taker_coin.ticker(), atomic_locktime_v);
-        log::info!(
-            "Entering the taker_swap_loop {}/{} with uuid: {}",
+        log_tag!(
+            ctx,
+            "";
+            fmt = "Entering the taker_swap_loop {}/{} with uuid: {}",
             maker_coin.ticker(),
             taker_coin.ticker(),
             uuid
@@ -3617,7 +3621,7 @@ struct OrderForRpcWithCancellationReason<'a> {
 }
 
 #[cfg(target_arch = "wasm32")]
-pub async fn order_status(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
+pub async fn order_status(_ctx: MmArc, _req: Json) -> Result<Response<Vec<u8>>, String> {
     let res = json!({
         "error": format!("'order_status' is only supported in native mode"),
     });

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, Weak};
 
 cfg_wasm32! {
     use crate::wasm_rpc::WasmRpcSender;
+    use crate::indexed_db::DbNamespaceId;
 }
 
 cfg_native! {
@@ -94,6 +95,8 @@ pub struct MmCtx {
     #[cfg(not(target_arch = "wasm32"))]
     pub sqlite_connection: Constructible<Mutex<Connection>>,
     pub mm_version: String,
+    #[cfg(target_arch = "wasm32")]
+    pub db_namespace: DbNamespaceId,
 }
 
 impl MmCtx {
@@ -120,6 +123,8 @@ impl MmCtx {
             #[cfg(not(target_arch = "wasm32"))]
             sqlite_connection: Constructible::default(),
             mm_version: "".into(),
+            #[cfg(target_arch = "wasm32")]
+            db_namespace: DbNamespaceId::Main,
         }
     }
 
@@ -179,6 +184,10 @@ impl MmCtx {
         }
         big as u16
     }
+
+    pub fn p2p_in_memory(&self) -> bool { self.conf["p2p_in_memory"].as_bool().unwrap_or(false) }
+
+    pub fn p2p_in_memory_port(&self) -> Option<u64> { self.conf["p2p_in_memory_port"].as_u64() }
 
     pub fn stop(&self) -> Result<(), String> {
         try_s!(self.stop.pin(true));
@@ -457,6 +466,8 @@ pub struct MmCtxBuilder {
     conf: Option<Json>,
     key_pair: Option<KeyPair>,
     version: String,
+    #[cfg(target_arch = "wasm32")]
+    db_namespace: DbNamespaceId,
 }
 
 impl MmCtxBuilder {
@@ -477,6 +488,12 @@ impl MmCtxBuilder {
         self
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn with_test_db_namespace(mut self) -> Self {
+        self.db_namespace = DbNamespaceId::for_test();
+        self
+    }
+
     pub fn into_mm_arc(self) -> MmArc {
         // NB: We avoid recreating LogState
         // in order not to interfere with the integration tests checking LogState drop on shutdown.
@@ -494,6 +511,11 @@ impl MmCtxBuilder {
         if let Some(key_pair) = self.key_pair {
             ctx.rmd160.pin(key_pair.public().address_hash()).unwrap();
             ctx.secp256k1_key_pair.pin(key_pair).unwrap();
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            ctx.db_namespace = self.db_namespace;
         }
 
         MmArc(Arc::new(ctx))

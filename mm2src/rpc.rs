@@ -299,8 +299,10 @@ pub extern "C" fn spawn_rpc(ctx_h: u32) {
 
     let rpc_ip_port = ctx.rpc_ip_port().unwrap();
     CORE.0.spawn({
-        info!(
-            ">>>>>>>>>> DEX stats {}:{} DEX stats API enabled at unixtime.{}  <<<<<<<<<",
+        log_tag!(
+            ctx,
+            "😉";
+            fmt = ">>>>>>>>>> DEX stats {}:{} DEX stats API enabled at unixtime.{}  <<<<<<<<<",
             rpc_ip_port.ip(),
             rpc_ip_port.port(),
             gstuff::now_ms() / 1000
@@ -348,8 +350,10 @@ pub fn spawn_rpc(ctx_h: u32) {
         return;
     }
 
-    info!(
-        ">>>>>>>>>> DEX stats API enabled at unixtime.{}  <<<<<<<<<",
+    log_tag!(
+        ctx,
+        "😉";
+        fmt = ">>>>>>>>>> DEX stats API enabled at unixtime.{}  <<<<<<<<<",
         common::now_ms() / 1000
     );
 }
